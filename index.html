@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gmail OTP Scanner — Read-Only Viewer</title>
+  <style>
+    :root{--bg:#f4f6fb;--card:#fff;--muted:#6b7280;--accent:#0b79f7;--radius:12px}
+    *{box-sizing:border-box}
+    body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial;margin:0;background:var(--bg);padding:20px;color:#0f172a}
+    .wrap{max-width:980px;margin:0 auto;background:linear-gradient(180deg,#fff,#fbfdff);padding:18px;border-radius:14px;box-shadow:0 8px 30px rgba(2,6,23,.06)}
+    header{display:flex;justify-content:space-between;align-items:center}
+    h1{margin:0;font-size:18px}
+    .controls{display:flex;gap:8px}
+    button{background:var(--accent);color:#fff;border:0;padding:10px 12px;border-radius:10px;cursor:pointer;font-weight:600}
+    button.ghost{background:transparent;color:var(--accent);border:1px solid rgba(11,121,247,.12)}
+    .muted{color:var(--muted);font-size:13px}
+    .layout{display:grid;grid-template-columns:300px 1fr;gap:16px;margin-top:14px}
+    .panel{background:var(--card);padding:12px;border-radius:10px;border:1px solid rgba(2,6,23,0.04)}
+    .inbox{max-height:520px;overflow:auto}
+    .row{padding:10px;border-radius:8px;margin-bottom:8px;cursor:pointer}
+    .row:hover{background:#f6f9ff}
+    .small{font-size:13px}
+    #codesList{margin-top:10px}
+    .code-item{background:#f8fafc;padding:8px;border-radius:8px;margin-bottom:6px}
+    footer{margin-top:12px;text-align:center;color:var(--muted);font-size:13px}
+    pre{white-space:pre-wrap;word-break:break-word}
+    @media (max-width:900px){ .layout{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+  <div class="wrap" role="main">
+    <header>
+      <div>
+        <h1>Gmail OTP Scanner — Read-only viewer</h1>
+        <div class="muted" id="status">Not signed in</div>
+      </div>
+      <div class="controls">
+        <button id="signInBtn">Sign in with Google</button>
+        <button id="disconnectBtn" style="display:none" class="ghost">Disconnect</button>
+        <button id="scanBtn" style="display:none" class="ghost">Scan Inbox for codes</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="font-weight:700">Inbox (preview)</div>
+          <div class="muted small" id="count">—</div>
+        </div>
+        <div class="inbox" id="inbox"></div>
+      </aside>
+
+      <section class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div>
+            <strong id="subject">Select a message</strong><div class="muted small" id="from"></div>
+          </div>
+          <div class="muted small" id="date">—</div>
+        </div>
+
+        <div id="body" class="small muted">Message body will appear here.</div>
+
+        <div style="margin-top:14px">
+          <h4>Found verification / OTP codes</h4>
+          <div id="codesList" class="small muted">No scan yet.</div>
+        </div>
+      </section>
+    </div>
+
+    <footer>
+      Locked to: <strong>chowdhurysabbin@gmail.com</strong> — replace CLIENT_ID in the script with your Google OAuth Client ID.
+    </footer>
+  </div>
+
+  <!-- Google Identity Services -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+  <script>
+  // ========== CONFIG ==========
+  const CLIENT_ID = 'REPLACE_WITH_GOOGLE_OAUTH_CLIENT_ID'; // <-- replace this
+  const ALLOWED_EMAIL = 'chowdhurysabbin@gmail.com';
+  const SCOPES = 'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email openid';
+  // ============================
+
+  const signInBtn = document.getElementById('signInBtn');
+  const disconnectBtn = document.getElementById('disconnectBtn');
+  const scanBtn = document.getElementById('scanBtn');
+  const status = document.getElementById('status');
+  const inboxEl = document.getElementById('inbox');
+  const countEl = document.getElementById('count');
+  const subjectEl = document.getElementById('subject');
+  const fromEl = document.getElementById('from');
+  const dateEl = document.getElementById('date');
+  const bodyEl = document.getElementById('body');
+  const codesList = document.getElementById('codesList');
+
+  let tokenClient = null;
+  let accessToken = null;
+  let currentEmail = null;
+  let cachedMessages = [];
+
+  function setStatus(t){ status.textContent = t; }
+
+  function escapeHtml(s){ if(!s) return ''; return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  // base64url decode
+  function b64UrlDecode(b64u) {
+    if (!b64u) return '';
+    b64u = b64u.replace(/-/g,'+').replace(/_/g,'/');
+    while (b64u.length % 4) b64u += '=';
+    try { return decodeURIComponent( atob(b64u).split('').map(c=>'%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('') ); }
+    catch(e){ try { return atob(b64u); } catch(e2){ return ''; } }
+  }
+
+  // extract body from payload (simplified)
+  function extractBody(payload) {
+    if (!payload) return '';
+    if (payload.body && payload.body.data) {
+      return b64UrlDecode(payload.body.data);
+    }
+    if (payload.parts && payload.parts.length) {
+      for (const p of payload.parts) {
+        const res = extractBody(p);
+        if (res) return res;
+      }
+    }
+    return '';
+  }
+
+  // simple OTP patterns (numbers 4-8 digits, alphanumeric tokens)
+  const OTP_REGEXES = [
+    /\b(\d{6})\b/g, // 6-digit
+    /\b(\d{4})\b/g, // 4-digit
+    /verification code[:\s]*([0-9A-Za-z\-]{4,12})/ig,
+    /\bOTP[:\s]*([0-9]{4,8})\b/ig,
+    /\b(code|pin)[:\s]*([0-9A-Za-z\-]{4,12})/ig
+  ];
+
+  function findOtpsInText(text){
+    if(!text) return [];
+    const found = new Map();
+    for (const r of OTP_REGEXES) {
+      let m;
+      // reset lastIndex for global regex
+      r.lastIndex = 0;
+      while ((m = r.exec(text)) !== null) {
+        // pick the first captured group with digits/letters
+        const candidate = (m[1] || m[2] || m[0]).toString().trim();
+        // ignore very common short numbers like year (optional improvement)
+        if (candidate.length >= 3) found.set(candidate, (found.get(candidate)||0)+1);
+      }
+    }
+    return Array.from(found.keys());
+  }
+
+  // Render list of messages (minimal)
+  async function renderInbox(messages) {
+    inboxEl.innerHTML = '';
+    countEl.textContent = messages.length + ' messages';
+    if (!messages.length) { inboxEl.innerHTML = '<div class="muted">No messages</div>'; return; }
+    for (const m of messages) {
+      const div = document.createElement('div');
+      div.className = 'row';
+      div.innerHTML = `<div style="font-weight:600">${escapeHtml(m.subject||'(no subject)')}</div><div class="muted small">${escapeHtml(m.from||'')} • ${escapeHtml(m.date||'')}</div>`;
+      div.addEventListener('click', () => openMessage(m.id));
+      inboxEl.appendChild(div);
+    }
+  }
+
+  async function openMessage(id){
+    setStatus('Loading message...');
+    try {
+      const res = await fetch(`https://www.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, {
+        headers: { Authorization: 'Bearer ' + accessToken }
+      });
+      if (!res.ok) throw new Error('Fetch failed ' + res.status);
+      const js = await res.json();
+      const headers = {};
+      (js.payload.headers||[]).forEach(h => headers[h.name.toLowerCase()] = h.value);
+      subjectEl.textContent = headers['subject'] || '(no subject)';
+      fromEl.textContent = headers['from'] || '';
+      dateEl.textContent = headers['date'] || '';
+      const txt = extractBody(js.payload) || js.snippet || '';
+      bodyEl.innerHTML = '<pre>' + escapeHtml(txt) + '</pre>';
+      setStatus('Message loaded');
+    } catch (e) {
+      console.error(e);
+      bodyEl.innerHTML = '<div class="muted">Error loading message: '+escapeHtml(e.message || e)+'</div>';
+      setStatus('Error');
+    }
+  }
+
+  // Scan inbox: fetch full body for each message (careful! limited to 25)
+  async function scanInboxForCodes() {
+    if (!accessToken) return alert('Sign in first');
+    setStatus('Scanning inbox for codes (may take a moment)...');
+    codesList.innerHTML = 'Scanning...';
+    const foundAll = [];
+    try {
+      // list messages (we'll use previous cached ids if available)
+      let ids = (cachedMessages && cachedMessages.map(m=>m.id)) || [];
+      if (!ids.length) {
+        const listRes = await fetch(`https://www.googleapis.com/gmail/v1/users/me/messages?labelIds=INBOX&maxResults=25`, {
+          headers: { Authorization: 'Bearer ' + accessToken }
+        });
+        if (!listRes.ok) throw new Error('List failed ' + listRes.status);
+        const listJson = await listRes.json();
+        ids = (listJson.messages || []).map(m=>m.id);
+      }
+
+      // fetch each full message but rate-limit slightly
+      for (let i=0;i<ids.length;i++){
+        const id = ids[i];
+        try {
+          const resp = await fetch(`https://www.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, {
+            headers: { Authorization: 'Bearer ' + accessToken }
+          });
+          if (!resp.ok) { continue; }
+          const msg = await resp.json();
+          const headers = {};
+          (msg.payload.headers||[]).forEach(h => headers[h.name.toLowerCase()] = h.value);
+          const from = headers['from'] || '';
+          const subject = headers['subject'] || '';
+          const date = headers['date'] || '';
+          const bodyText = extractBody(msg.payload) || msg.snippet || '';
+          const codes = findOtpsInText(bodyText);
+          if (codes.length) {
+            for (const c of codes) {
+              foundAll.push({ code: c, from, subject, date, id });
+            }
+          }
+          // small delay to be polite
+          await new Promise(r => setTimeout(r, 180));
+        } catch(e){ continue; }
+      }
+
+      // render found codes
+      if (!foundAll.length) {
+        codesList.innerHTML = '<div class="muted">No verification codes found in the scanned messages.</div>';
+        setStatus('Scan complete — no codes found');
+        return;
+      }
+      codesList.innerHTML = '';
+      for (const item of foundAll) {
+        const d = document.createElement('div');
+        d.className = 'code-item';
+        d.innerHTML = `<strong>${escapeHtml(item.code)}</strong> — <span class="muted">${escapeHtml(item.from||'')}</span><br><small class="muted">${escapeHtml(item.subject||'')}</small> • <span class="muted">${escapeHtml(item.date||'')}</span> <button style="float:right" onclick="openById('${item.id}');">Open</button>`;
+        codesList.appendChild(d);
+      }
+      setStatus('Scan complete — found ' + foundAll.length + ' code(s)');
+    } catch (err) {
+      console.error(err);
+      codesList.innerHTML = '<div class="muted">Error scanning: '+escapeHtml(err.message||err)+'</div>';
+      setStatus('Scan error');
+    }
+  }
+
+  // helper called from dynamic HTML (open message)
+  window.openById = function(id){ openMessage(id); };
+
+  // Initialize GIS token client
+  function initTokenClient() {
+    if (!window.google || !google.accounts || !google.accounts.oauth2) {
+      console.error('Google Identity not loaded yet');
+      return;
+    }
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: SCOPES,
+      callback: (resp) => {
+        if (resp.error) {
+          setStatus('Auth error');
+          console.error(resp);
+          return;
+        }
+        accessToken = resp.access_token;
+        setStatus('Access token acquired');
+        // confirm user
+        fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + accessToken } })
+          .then(r=>r.json()).then(profile=>{
+            const em = (profile && profile.email) || '';
+            if (em.toLowerCase() !== ALLOWED_EMAIL.toLowerCase()) {
+              // revoke and refuse
+              fetch('https://oauth2.googleapis.com/revoke?token=' + accessToken, { method: 'POST' }).finally(()=>{
+                accessToken = null;
+                setStatus('Signed-in account not allowed');
+                alert('Please sign-in with the allowed email: ' + ALLOWED_EMAIL);
+              });
+              return;
+            }
+            currentEmail = em;
+            setStatus('Signed in as ' + (profile.name || em));
+            // show UI controls
+            signInBtn.style.display = 'none';
+            disconnectBtn.style.display = 'inline-block';
+            scanBtn.style.display = 'inline-block';
+            // load Inbox preview
+            loadInboxPreview();
+          }).catch(e=>{ setStatus('Profile fetch failed'); });
+      }
+    });
+  }
+
+  // load preview (list metadata only)
+  async function loadInboxPreview(){
+    setStatus('Loading inbox preview...');
+    inboxEl.innerHTML = '<div class="muted">Loading...</div>';
+    try {
+      const res = await fetch(`https://www.googleapis.com/gmail/v1/users/me/messages?labelIds=INBOX&maxResults=25`, {
+        headers: { Authorization: 'Bearer ' + accessToken }
+      });
+      if (!res.ok) throw new Error('List failed ' + res.status);
+      const js = await res.json();
+      const ids = (js.messages || []).slice(0,25).map(m => m.id);
+      // fetch metadata for each (parallel-ish)
+      const details = await Promise.all(ids.map(async id => {
+        try {
+          const r = await fetch(`https://www.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`, {
+            headers: { Authorization: 'Bearer ' + accessToken }
+          });
+          if (!r.ok) return null;
+          const j = await r.json();
+          const h = {};
+          (j.payload.headers||[]).forEach(x => h[x.name.toLowerCase()] = x.value);
+          return { id: j.id, subject: h.subject||'(no subject)', from: h.from||'', date: h.date||'', snippet: j.snippet || '' };
+        } catch(e){ return null; }
+      }));
+      cachedMessages = details.filter(Boolean);
+      renderInbox(cachedMessages);
+      setStatus('Inbox preview loaded');
+    } catch (e) {
+      console.error(e);
+      inboxEl.innerHTML = '<div class="muted">Error loading inbox: ' + escapeHtml(e.message||e) + '</div>';
+      setStatus('Error');
+    }
+  }
+
+  // disconnect
+  async function disconnect(){
+    if (accessToken) {
+      await fetch('https://oauth2.googleapis.com/revoke?token=' + accessToken, { method: 'POST' }).catch(()=>{});
+    }
+    accessToken = null;
+    currentEmail = null;
+    cachedMessages = [];
+    inboxEl.innerHTML = '';
+    countEl.textContent = '—';
+    subjectEl.textContent = 'Select a message';
+    fromEl.textContent = '';
+    dateEl.textContent = '—';
+    bodyEl.innerHTML = 'Message body will appear here.';
+    codesList.innerHTML = 'No scan yet.';
+    signInBtn.style.display = 'inline-block';
+    disconnectBtn.style.display = 'none';
+    scanBtn.style.display = 'none';
+    setStatus('Not signed in');
+  }
+
+  // wire up buttons
+  signInBtn.addEventListener('click', () => {
+    if (!tokenClient) return alert('Not ready, refresh the page');
+    tokenClient.requestAccessToken({ prompt: 'consent' });
+  });
+  disconnectBtn.addEventListener('click', disconnect);
+  scanBtn.addEventListener('click', scanInboxForCodes);
+
+  window.addEventListener('load', () => {
+    initTokenClient();
+    // ensure token client initialized after GIS script loads
+    setTimeout(()=>{ if (!tokenClient && window.google && google.accounts && google.accounts.oauth2) initTokenClient(); }, 800);
+  });
+  </script>
+</body>
+</html>
